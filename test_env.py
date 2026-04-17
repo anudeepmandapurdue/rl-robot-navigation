@@ -1,15 +1,19 @@
+from stable_baselines3 import PPO
 from env.navigation_env import NavigationEnv
-import numpy as np
+import time
 
-environment = NavigationEnv(render=True)
-obs = environment.reset()
+env = NavigationEnv(render=True)
 
-for i in range(200):
-    action = np.array([5.0,0.0])
-    obs, reward, done, info = environment.step(action)
+model = PPO.load("nav_model")
 
-    print(reward)
+obs, info = env.reset()
 
-    if done:
-        print("Episode finished")
-        obs = environment.reset()
+while True:
+    action, _ = model.predict(obs, deterministic=True)
+
+    obs, reward, done, truncated, info = env.step(action)
+
+    time.sleep(0.001)
+
+    if done or truncated:
+        obs, info = env.reset()

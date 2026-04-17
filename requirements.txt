@@ -4,3 +4,4 @@ gym
 stable-baselines3
 torch
 envs
+gymnasium
