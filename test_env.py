@@ -1,19 +1,15 @@
 from stable_baselines3 import PPO
 from env.navigation_env import NavigationEnv
-import time
 
 env = NavigationEnv(render=True)
 
 model = PPO.load("nav_model")
 
-obs, info = env.reset()
+obs, _ = env.reset()
 
 while True:
     action, _ = model.predict(obs, deterministic=True)
-
-    obs, reward, done, truncated, info = env.step(action)
-
-    time.sleep(0.001)
+    obs, reward, done, truncated, _ = env.step(action)
 
     if done or truncated:
-        obs, info = env.reset()
+        obs, _ = env.reset()
