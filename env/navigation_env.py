@@ -19,18 +19,20 @@ class NavigationEnv(gym.Env):
         self.action_space = gym.spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
         )
 
-        # Observation (kept stable + normalized-ish)
+        # Observation: fully normalized [-1, 1] except yaw in [-1, 1]
         self.observation_space = gym.spaces.Box(
-            low=np.array([-1, -1, -np.pi, -1, -1, -1], dtype=np.float32),
-            high=np.array([1, 1, np.pi, 1, 1, 1], dtype=np.float32),
+            low=np.array([-1, -1, -1, -1, -1, -1], dtype=np.float32),
+            high=np.array([1, 1, 1, 1, 1, 1], dtype=np.float32),
+            dtype=np.float32
         )
 
         self.robot = None
         self.goal = None
         self.steps = 0
-        self.prev_dist = None   # ✅ FIX 1
+        self.prev_dist = None
 
     # =========================
     def reset(self, seed=None, options=None):
@@ -43,7 +45,7 @@ class NavigationEnv(gym.Env):
         self.robot = p.loadURDF("r2d2.urdf", [0, 0, 0.1])
 
         self.steps = 0
-        self.prev_dist = None   # reset each episode
+        self.prev_dist = None
 
         self.np_random = np.random.default_rng(seed)
         self.goal = self.np_random.uniform(-2, 2, size=2).astype(np.float32)
@@ -64,7 +66,7 @@ class NavigationEnv(gym.Env):
         forward, turn = action
 
         forward_speed = forward * 2.0
-        turn_speed = turn * 1.0   # slightly reduced (more stable)
+        turn_speed = turn * 1.0
 
         pos, orn = p.getBasePositionAndOrientation(self.robot)
         rot = p.getMatrixFromQuaternion(orn)
@@ -85,25 +87,23 @@ class NavigationEnv(gym.Env):
 
         obs = self._get_obs()
         reward = self._compute_reward()
+        done = self._check_done()
 
-        terminated = self._check_done()
-        truncated = self.steps >= 200   # ✅ FIX 5
+        truncated = self.steps >= 200
 
-        return obs, reward, terminated, truncated, {}
+        return obs, reward, done, truncated, {}
 
     # =========================
     def _get_obs(self):
         pos, orn = p.getBasePositionAndOrientation(self.robot)
         xy = np.array(pos[:2], dtype=np.float32)
 
-        yaw = p.getEulerFromQuaternion(orn)[2]
+        yaw = p.getEulerFromQuaternion(orn)[2] / np.pi  # normalize
 
         goal_vec = self.goal - xy
-        dist = np.linalg.norm(goal_vec) + 1e-8
 
-        # normalized direction (important fix)
-        direction = goal_vec / 4.0
-        direction = np.clip(direction, -1, 1)
+        # normalize by environment scale (goal in [-2,2])
+        direction = np.clip(goal_vec / 2.0, -1, 1)
 
         linear_vel, angular_vel = p.getBaseVelocity(self.robot)
 
@@ -126,24 +126,24 @@ class NavigationEnv(gym.Env):
 
         dist = np.linalg.norm(xy - self.goal)
 
-        # initialize prev_dist
+        # initialize prev distance
         if self.prev_dist is None:
             self.prev_dist = dist
 
-        # ✅ FIX 1: correct progress reward
+        # FIX: correct progress calculation
         progress = self.prev_dist - dist
-
-        # update for next step
         self.prev_dist = dist
 
-        reward = progress * 10.0   # main signal
+        progress = np.clip(progress, -0.2, 0.2)
 
-        # time penalty
-        reward -= 0.01
+        reward = progress * 20.0
 
-        # success bonus (FIX 2)
+        # small shaping penalty (distance pressure)
+        reward -= 0.005 * dist
+
+        # success bonus handled in done, not reward logic
         if dist < 0.2:
-            reward += 50.0
+            reward += 100.0
 
         return float(reward)
 
