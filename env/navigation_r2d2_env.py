@@ -16,15 +16,12 @@ class NavigationEnv(gym.Env):
         p.setGravity(0, 0, -9.8)
 
         # Action = [forward, turn]
-        # continuous control → smoother than discrete
         self.action_space = gym.spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32),
             high=np.array([1.0, 1.0], dtype=np.float32),
         )
 
-        # 🔥 CHANGED: observation now includes angle-to-goal info
-        # before: agent had to "figure out" angle from raw data
-        # now: we GIVE it directly → much easier learning
+        # Observation includes goal direction + angle info + velocity
         self.observation_space = gym.spaces.Box(
             low=-1,
             high=1,
@@ -37,8 +34,8 @@ class NavigationEnv(gym.Env):
         self.steps = 0
         self.prev_dist = None
 
-        # 🔥 NEW: used for action smoothing (reduces jitter)
-        self.prev_action = np.zeros(2)
+        # Action smoothing
+        self.prev_action = np.zeros(2, dtype=np.float32)
 
     # =========================
     def reset(self, seed=None, options=None):
@@ -52,9 +49,9 @@ class NavigationEnv(gym.Env):
 
         self.steps = 0
         self.prev_dist = None
-        self.prev_action = np.zeros(2)
+        self.prev_action = np.zeros(2, dtype=np.float32)
 
-        # random goal → generalization
+        # random goal
         self.np_random = np.random.default_rng(seed)
         self.goal = self.np_random.uniform(-2, 2, size=2).astype(np.float32)
 
@@ -72,8 +69,7 @@ class NavigationEnv(gym.Env):
 
         action = np.clip(action, -1, 1)
 
-        # 🔥 NEW: action smoothing
-        # prevents jerky motion → more stable learning
+        # smoothing
         action = 0.7 * self.prev_action + 0.3 * action
         self.prev_action = action
 
@@ -85,11 +81,13 @@ class NavigationEnv(gym.Env):
         pos, orn = p.getBasePositionAndOrientation(self.robot)
         rot = p.getMatrixFromQuaternion(orn)
 
-        # robot forward direction in world frame
-        forward_dir = np.array([rot[0], rot[3], rot[6]], dtype=np.float32)
+        forward_dir = np.array(
+            [rot[0], rot[3], rot[6]],
+            dtype=np.float32
+        )
+
         velocity = forward_dir * forward_speed
 
-        # apply velocity
         p.resetBaseVelocity(
             self.robot,
             linearVelocity=velocity.tolist(),
@@ -102,12 +100,10 @@ class NavigationEnv(gym.Env):
             time.sleep(1 / 240)
 
         obs = self._get_obs()
-
-        # reward now uses improved shaping
         reward = self._compute_reward(action)
 
         done = self._check_done()
-        truncated = self.steps >= 400  # 🔥 longer episodes = better learning
+        truncated = self.steps >= 400
 
         return obs, reward, done, truncated, {}
 
@@ -121,29 +117,21 @@ class NavigationEnv(gym.Env):
         goal_vec = self.goal - xy
         dist = np.linalg.norm(goal_vec)
 
-        # normalized direction to goal
         goal_dir = goal_vec / (dist + 1e-6)
 
-        # 🔥 CRITICAL CHANGE:
-        # compute relative angle between robot heading and goal
         goal_angle = np.arctan2(goal_vec[1], goal_vec[0])
         angle_diff = goal_angle - yaw
 
-        # normalize angle → avoids discontinuity at ±pi
+        # normalize angle
         angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
 
         linear_vel, angular_vel = p.getBaseVelocity(self.robot)
 
         return np.array([
-            goal_dir[0],                  # where goal is (x)
-            goal_dir[1],                  # where goal is (y)
-
-            # 🔥 HUGE IMPROVEMENT:
-            # instead of raw angle → use cos/sin
-            # makes learning smooth + avoids wrap issues
+            goal_dir[0],
+            goal_dir[1],
             np.cos(angle_diff),
             np.sin(angle_diff),
-
             linear_vel[0] / 3.0,
             linear_vel[1] / 3.0,
             angular_vel[2] / 3.0
@@ -159,41 +147,28 @@ class NavigationEnv(gym.Env):
         if self.prev_dist is None:
             self.prev_dist = dist
 
-        # 🔥 CORE REWARD SIGNAL:
-        # reward progress toward goal
+        # progress reward
         progress = self.prev_dist - dist
         self.prev_dist = dist
 
-        reward = 15.0 * progress  
-        # ↑ stronger than before → clearer learning signal
+        reward = 15.0 * progress
 
-        # -------------------------
-        # 🔥 MOST IMPORTANT CHANGE
-        # -------------------------
-        # reward pointing toward the goal
-
+        # heading reward
         yaw = p.getEulerFromQuaternion(orn)[2]
-        goal_angle = np.arctan2(self.goal[1] - xy[1], self.goal[0] - xy[0])
+        goal_angle = np.arctan2(
+            self.goal[1] - xy[1],
+            self.goal[0] - xy[0]
+        )
+
         angle_diff = goal_angle - yaw
         angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
 
-        # 🔥 THIS is what makes the agent "face the right direction"
         reward += 1.0 * np.cos(angle_diff)
 
-        # WHY THIS WORKS:
-        # cos(angle_diff) =
-        #   +1 → perfectly facing goal
-        #   0  → sideways
-        #  -1 → facing away
-        #
-        # → agent learns:
-        # "I should rotate until this becomes +1"
-
-        # -------------------------
-        # discourage useless spinning
+        # turning penalty
         reward -= 0.05 * abs(action[1])
 
-        # small time penalty
+        # time penalty
         reward -= 0.01
 
         # success reward

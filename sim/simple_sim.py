@@ -1,21 +1,45 @@
-import pybullet as p 
+import pybullet as p
 import pybullet_data
 import time
+import os
 
-def run_sim():
-    p.connect(p.GUI)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+# Connect
+p.connect(p.GUI)
 
-    p.loadURDF("plane.urdf")
-    robot = p.loadURDF("r2d2.urdf", [0,0,0.1])
+# ----------------------------
+# 1. Built-in PyBullet assets
+# ----------------------------
+data_path = pybullet_data.getDataPath()
+p.setAdditionalSearchPath(data_path)
 
-    for _ in range(10000):
-        p.resetBaseVelocity(robot, linearVelocity = [1,1,0.5])
-        p.stepSimulation()
-        time.sleep(1/240)
+# Load ground
+plane = p.loadURDF(os.path.join(data_path, "plane.urdf"))
 
-    p.disconnect
+# ----------------------------
+# 2. TurtleBot3 assets (LOCAL)
+# ----------------------------
 
+# IMPORTANT: change this if your folder is elsewhere
+turtlebot_path = "assets/turtlebot3/turtlebot3_description/urdf"
 
-if __name__ == "__main__":
-    run_sim()
+p.setAdditionalSearchPath(turtlebot_path)
+
+# Load robot (explicit file reference)
+robot = p.loadURDF("turtlebot3_burger.urdf", [0, 0, 0.1])
+
+# ----------------------------
+# 3. Physics
+# ----------------------------
+p.setGravity(0, 0, -9.81)
+
+# Print joints so we can control it later
+print("\n--- JOINT INFO ---")
+for i in range(p.getNumJoints(robot)):
+    print(p.getJointInfo(robot, i))
+
+# ----------------------------
+# 4. Simulation loop
+# ----------------------------
+while True:
+    p.stepSimulation()
+    time.sleep(1./240.)

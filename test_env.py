@@ -1,13 +1,15 @@
 from stable_baselines3 import PPO
-from env.navigation_env import NavigationEnv
+from env.navigation_turtle_env import NavigationEnv
 
+# Create env with rendering
 env = NavigationEnv(render=True)
 
-model = PPO.load("nav_model")
+# Load trained model
+model = PPO.load("ppo_turtlebot_nav_15")
 
 obs, _ = env.reset()
 
-while True:
+for _ in range(1000):
     action, _ = model.predict(obs, deterministic=True)
     obs, reward, done, truncated, _ = env.step(action)
 
