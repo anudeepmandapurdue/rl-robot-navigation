@@ -16,18 +16,17 @@ class NavigationEnv(gym.Env):
         self.data_path = pybullet_data.getDataPath()
         self.BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-        # Action: [forward, turn]
         self.action_space = gym.spaces.Box(
             low=np.array([-1.0, -1.0]),
             high=np.array([1.0, 1.0]),
             dtype=np.float32
         )
 
-        self.num_obstacles = 2  # change this to add more obstacles
+        self.num_obstacles = 5
         self.observation_space = gym.spaces.Box(
             low=-1,
             high=1,
-            shape=(7 + self.num_obstacles * 2,),
+            shape=(7 + self.num_obstacles * 3,),
             dtype=np.float32
         )
 
@@ -71,16 +70,15 @@ class NavigationEnv(gym.Env):
 
         self.robot = p.loadURDF(urdf_path, [0, 0, 0.1])
 
-        # Base link dynamics
         p.changeDynamics(
             self.robot,
             -1,
-            linearDamping=0.0,
-            angularDamping=0.0,
-            lateralFriction=0.8
+            linearDamping=0.1,
+            angularDamping=0.1,
+            lateralFriction=0.8,
+            restitution=0.0
         )
 
-        # Joint dynamics
         for i in range(p.getNumJoints(self.robot)):
             p.changeDynamics(
                 self.robot,
@@ -90,7 +88,6 @@ class NavigationEnv(gym.Env):
                 lateralFriction=0.9
             )
 
-        # Detect wheels
         self.left_wheel = None
         self.right_wheel = None
 
@@ -101,14 +98,12 @@ class NavigationEnv(gym.Env):
             if "right" in name:
                 self.right_wheel = i
 
-        # Reset episode vars
         self.steps = 0
         self.prev_dist = None
         self.prev_action = np.zeros(2, dtype=np.float32)
 
-        # Random goal
         self.np_random = np.random.default_rng(seed)
-        self.goal = self.np_random.uniform(-1, 1, size=2).astype(np.float32)
+        self.goal = self.np_random.uniform(-1.0, 1.0, size=2).astype(np.float32)
 
         p.loadURDF(
             os.path.join(self.data_path, "sphere_small.urdf"),
@@ -116,7 +111,6 @@ class NavigationEnv(gym.Env):
             globalScaling=2.0
         )
 
-        # Spawn obstacles
         self.obstacles = []
 
         for _ in range(self.num_obstacles):
@@ -134,8 +128,19 @@ class NavigationEnv(gym.Env):
             obs_id = p.loadURDF(
                 os.path.join(self.data_path, "cube_small.urdf"),
                 [obs_pos[0], obs_pos[1], 0.1],
-                globalScaling=1.5
+                globalScaling=1.5,
+                useFixedBase=True  # CRITICAL: makes obstacle immovable
             )
+
+            # Make obstacle high friction and no bounce so robot can't push through
+            p.changeDynamics(
+                obs_id,
+                -1,
+                lateralFriction=1.0,
+                restitution=0.0,
+                mass=0  # mass=0 = static, cannot be moved by any force
+            )
+
             self.obstacles.append(obs_id)
 
         return self._get_obs(), {}
@@ -150,7 +155,7 @@ class NavigationEnv(gym.Env):
         self.prev_action = action
 
         forward, turn = action
-        speed = 25.0
+        speed = 15.0  # reduced from 25 — high speed overpowers collision physics
 
         left = (forward - 0.4 * turn) * speed
         right = (forward + 0.4 * turn) * speed
@@ -160,14 +165,14 @@ class NavigationEnv(gym.Env):
             self.left_wheel,
             p.VELOCITY_CONTROL,
             targetVelocity=left,
-            force=5000
+            force=800  # reduced from 5000 — lower force respects physics collisions
         )
         p.setJointMotorControl2(
             self.robot,
             self.right_wheel,
             p.VELOCITY_CONTROL,
             targetVelocity=right,
-            force=5000
+            force=800
         )
 
         for _ in range(4):
@@ -215,10 +220,22 @@ class NavigationEnv(gym.Env):
         obs_vecs = []
         for obs_id in self.obstacles:
             obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
-            rel = np.clip((np.array(obs_pos_world[:2], dtype=np.float32) - xy) / 2.0, -1, 1)
-            obs_vecs.extend(rel)
+            rel = np.array(obs_pos_world[:2], dtype=np.float32) - xy
+            rel_norm = np.clip(rel / 2.0, -1, 1)
+            obs_dist = np.linalg.norm(rel)
+            closeness = np.clip(1.0 - obs_dist / 0.8, 0.0, 1.0)
+            obs_vecs.extend([rel_norm[0], rel_norm[1], closeness])
 
         return np.concatenate([base_obs, np.array(obs_vecs, dtype=np.float32)])
+
+    # =========================
+    def _check_collision(self):
+        # Use real PyBullet contact detection instead of distance approximation
+        for obs_id in self.obstacles:
+            contacts = p.getContactPoints(self.robot, obs_id)
+            if contacts and len(contacts) > 0:
+                return True
+        return False
 
     # =========================
     def _compute_reward(self, action):
@@ -235,40 +252,33 @@ class NavigationEnv(gym.Env):
 
         reward = 20.0 * progress
 
-        # Heading alignment
         yaw = p.getEulerFromQuaternion(orn)[2]
         goal_angle = np.arctan2(self.goal[1] - xy[1], self.goal[0] - xy[0])
         angle_diff = np.arctan2(np.sin(goal_angle - yaw), np.cos(goal_angle - yaw))
         reward += 0.8 * np.cos(angle_diff)
 
-        # Penalize turning
-        reward -= 0.08 * abs(action[1])
-
-        # Penalize angular velocity
         _, angular_vel = p.getBaseVelocity(self.robot)
-        reward -= 0.05 * abs(angular_vel[2])
+        reward -= 0.03 * abs(angular_vel[2])
 
-        # Mild time penalty
         reward -= 0.001
-
-        # Mild distance penalty
         reward -= 0.01 * dist
 
-        # Success — early return so obstacle penalty doesn't cancel it
+        # Success
         if dist < 0.2:
             speed_bonus = 40.0 * (1.0 - self.steps / self.max_steps)
             return float(reward + 300.0 + speed_bonus)
 
-        # Obstacle penalties
+        # Real contact penalty
+        if self._check_collision():
+            reward -= 100.0
+
+        # Soft proximity penalty
         for obs_id in self.obstacles:
             obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
             obs_xy = np.array(obs_pos_world[:2], dtype=np.float32)
             obs_dist = np.linalg.norm(xy - obs_xy)
-
-            if obs_dist < 0.25:
-                reward -= 50.0
-            elif obs_dist < 0.5:
-                reward -= 5.0 * (0.5 - obs_dist)
+            if obs_dist < 0.5:
+                reward -= 6.0 * (0.4 - obs_dist)
 
         return float(reward)
 
@@ -277,13 +287,4 @@ class NavigationEnv(gym.Env):
         pos, _ = p.getBasePositionAndOrientation(self.robot)
         xy = np.array(pos[:2], dtype=np.float32)
 
-        if np.linalg.norm(xy - self.goal) < 0.2:
-            return True
-
-        for obs_id in self.obstacles:
-            obs_pos, _ = p.getBasePositionAndOrientation(obs_id)
-            obs_xy = np.array(obs_pos[:2], dtype=np.float32)
-            if np.linalg.norm(xy - obs_xy) < 0.25:
-                return True
-
-        return False
+        return np.linalg.norm(xy - self.goal) < 0.2
