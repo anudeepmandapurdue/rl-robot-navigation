@@ -23,8 +23,8 @@ model = PPO(
     tensorboard_log="./ppo_nav_logs/"
 )
 
-model.learn(total_timesteps=500_000)
+model.learn(total_timesteps=700_000)
 
-model.save("ppo_turtlebot_nav_15")
+model.save("ppo_turtlebot_nav_18")
 
 print("Training complete.")

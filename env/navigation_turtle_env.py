@@ -23,16 +23,17 @@ class NavigationEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Observation: goal_dir + angle + velocity
+        self.num_obstacles = 2  # change this to add more obstacles
         self.observation_space = gym.spaces.Box(
             low=-1,
             high=1,
-            shape=(7,),
+            shape=(7 + self.num_obstacles * 2,),
             dtype=np.float32
         )
 
         self.robot = None
         self.goal = None
+        self.obstacles = []
         self.left_wheel = None
         self.right_wheel = None
 
@@ -107,13 +108,35 @@ class NavigationEnv(gym.Env):
 
         # Random goal
         self.np_random = np.random.default_rng(seed)
-        self.goal = self.np_random.uniform(-1.5, 1.5, size=2).astype(np.float32)
+        self.goal = self.np_random.uniform(-1, 1, size=2).astype(np.float32)
 
         p.loadURDF(
             os.path.join(self.data_path, "sphere_small.urdf"),
             [self.goal[0], self.goal[1], 0.1],
             globalScaling=2.0
         )
+
+        # Spawn obstacles
+        self.obstacles = []
+
+        for _ in range(self.num_obstacles):
+            while True:
+                obs_pos = self.np_random.uniform(-0.7, 0.7, size=2).astype(np.float32)
+                too_close_to_robot = np.linalg.norm(obs_pos) < 0.4
+                too_close_to_goal = np.linalg.norm(obs_pos - self.goal) < 0.4
+                too_close_to_others = any(
+                    np.linalg.norm(obs_pos - np.array(p.getBasePositionAndOrientation(o)[0][:2])) < 0.4
+                    for o in self.obstacles
+                )
+                if not too_close_to_robot and not too_close_to_goal and not too_close_to_others:
+                    break
+
+            obs_id = p.loadURDF(
+                os.path.join(self.data_path, "cube_small.urdf"),
+                [obs_pos[0], obs_pos[1], 0.1],
+                globalScaling=1.5
+            )
+            self.obstacles.append(obs_id)
 
         return self._get_obs(), {}
 
@@ -123,14 +146,12 @@ class NavigationEnv(gym.Env):
 
         action = np.clip(action, -1, 1)
 
-        # 50/50 smooth blend
-        action = 0.4 * self.prev_action + 0.6 * action 
+        action = 0.4 * self.prev_action + 0.6 * action
         self.prev_action = action
 
         forward, turn = action
         speed = 25.0
 
-        # Gentle steering
         left = (forward - 0.4 * turn) * speed
         right = (forward + 0.4 * turn) * speed
 
@@ -149,7 +170,6 @@ class NavigationEnv(gym.Env):
             force=5000
         )
 
-        # Multiple substeps for smoother physics
         for _ in range(4):
             p.stepSimulation()
 
@@ -179,11 +199,10 @@ class NavigationEnv(gym.Env):
         angle_diff = np.arctan2(np.sin(angle_diff), np.cos(angle_diff))
 
         linear_vel, angular_vel = p.getBaseVelocity(self.robot)
-
         lin_speed = np.linalg.norm(linear_vel[:2])
         lin_dir = np.array(linear_vel[:2]) / (lin_speed + 1e-6)
 
-        return np.array([
+        base_obs = np.array([
             goal_dir[0],
             goal_dir[1],
             np.cos(angle_diff),
@@ -192,6 +211,14 @@ class NavigationEnv(gym.Env):
             np.clip(lin_dir[0], -1, 1),
             np.clip(angular_vel[2] / 5.0, -1, 1)
         ], dtype=np.float32)
+
+        obs_vecs = []
+        for obs_id in self.obstacles:
+            obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
+            rel = np.clip((np.array(obs_pos_world[:2], dtype=np.float32) - xy) / 2.0, -1, 1)
+            obs_vecs.extend(rel)
+
+        return np.concatenate([base_obs, np.array(obs_vecs, dtype=np.float32)])
 
     # =========================
     def _compute_reward(self, action):
@@ -206,7 +233,6 @@ class NavigationEnv(gym.Env):
         progress = self.prev_dist - dist
         self.prev_dist = dist
 
-        # Strong progress signal
         reward = 20.0 * progress
 
         # Heading alignment
@@ -215,23 +241,34 @@ class NavigationEnv(gym.Env):
         angle_diff = np.arctan2(np.sin(goal_angle - yaw), np.cos(goal_angle - yaw))
         reward += 0.8 * np.cos(angle_diff)
 
-        # Penalize turning once only
+        # Penalize turning
         reward -= 0.08 * abs(action[1])
 
-        # Penalize angular velocity directly
+        # Penalize angular velocity
         _, angular_vel = p.getBaseVelocity(self.robot)
         reward -= 0.05 * abs(angular_vel[2])
 
         # Mild time penalty
-        reward -= 0.01
+        reward -= 0.001
 
         # Mild distance penalty
-        reward -= 0.05 * dist
+        reward -= 0.01 * dist
 
-        # Success
+        # Success — early return so obstacle penalty doesn't cancel it
         if dist < 0.2:
             speed_bonus = 40.0 * (1.0 - self.steps / self.max_steps)
-            reward += 300.0 + speed_bonus
+            return float(reward + 300.0 + speed_bonus)
+
+        # Obstacle penalties
+        for obs_id in self.obstacles:
+            obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
+            obs_xy = np.array(obs_pos_world[:2], dtype=np.float32)
+            obs_dist = np.linalg.norm(xy - obs_xy)
+
+            if obs_dist < 0.25:
+                reward -= 50.0
+            elif obs_dist < 0.5:
+                reward -= 5.0 * (0.5 - obs_dist)
 
         return float(reward)
 
@@ -240,4 +277,13 @@ class NavigationEnv(gym.Env):
         pos, _ = p.getBasePositionAndOrientation(self.robot)
         xy = np.array(pos[:2], dtype=np.float32)
 
-        return np.linalg.norm(xy - self.goal) < 0.2
+        if np.linalg.norm(xy - self.goal) < 0.2:
+            return True
+
+        for obs_id in self.obstacles:
+            obs_pos, _ = p.getBasePositionAndOrientation(obs_id)
+            obs_xy = np.array(obs_pos[:2], dtype=np.float32)
+            if np.linalg.norm(xy - obs_xy) < 0.25:
+                return True
+
+        return False
