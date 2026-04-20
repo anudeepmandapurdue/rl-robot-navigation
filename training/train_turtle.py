@@ -25,6 +25,6 @@ model = PPO(
 
 model.learn(total_timesteps=700_000)
 
-model.save("ppo_turtlebot_nav_21")
+model.save("ppo_turtlebot_nav_26")
 
 print("Training complete.")

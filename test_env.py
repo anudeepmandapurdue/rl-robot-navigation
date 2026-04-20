@@ -5,7 +5,7 @@ from env.navigation_turtle_env import NavigationEnv
 env = NavigationEnv(render=True)
 
 # Load trained model
-model = PPO.load("ppo_turtlebot_nav_20")
+model = PPO.load("ppo_turtlebot_nav_26")
 
 obs, _ = env.reset()
 

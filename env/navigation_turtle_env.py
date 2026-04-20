@@ -22,24 +22,28 @@ class NavigationEnv(gym.Env):
             dtype=np.float32
         )
 
-        self.num_obstacles = 5
+        self.num_obstacles = 2
+        self.obstacle_speed = 0.15
+
+        # 7 base + per obstacle: rel_x, rel_y, closeness, vel_x, vel_y
         self.observation_space = gym.spaces.Box(
             low=-1,
             high=1,
-            shape=(7 + self.num_obstacles * 3,),
+            shape=(7 + self.num_obstacles * 5,),
             dtype=np.float32
         )
 
         self.robot = None
         self.goal = None
         self.obstacles = []
+        self.obstacle_velocities = []
         self.left_wheel = None
         self.right_wheel = None
 
         self.steps = 0
         self.prev_dist = None
         self.prev_action = np.zeros(2, dtype=np.float32)
-        self.max_steps = 400
+        self.max_steps = 300
 
     # =========================
     def reset(self, seed=None, options=None):
@@ -112,6 +116,7 @@ class NavigationEnv(gym.Env):
         )
 
         self.obstacles = []
+        self.obstacle_velocities = []
 
         for _ in range(self.num_obstacles):
             while True:
@@ -129,51 +134,78 @@ class NavigationEnv(gym.Env):
                 os.path.join(self.data_path, "cube_small.urdf"),
                 [obs_pos[0], obs_pos[1], 0.1],
                 globalScaling=1.5,
-                useFixedBase=True  # CRITICAL: makes obstacle immovable
+                useFixedBase=False
             )
 
-            # Make obstacle high friction and no bounce so robot can't push through
             p.changeDynamics(
                 obs_id,
                 -1,
-                lateralFriction=1.0,
+                lateralFriction=0.0,
                 restitution=0.0,
-                mass=0  # mass=0 = static, cannot be moved by any force
+                linearDamping=0.0,
+                angularDamping=0.0
             )
 
+            angle = self.np_random.uniform(0, 2 * np.pi)
+            vel = np.array([np.cos(angle), np.sin(angle)]) * self.obstacle_speed
+            self.obstacle_velocities.append(vel)
             self.obstacles.append(obs_id)
 
         return self._get_obs(), {}
+
+    # =========================
+    def _update_obstacles(self):
+        bounds = 0.9
+
+        for i, obs_id in enumerate(self.obstacles):
+            pos, _ = p.getBasePositionAndOrientation(obs_id)
+            xy = np.array(pos[:2])
+            vel = self.obstacle_velocities[i].copy()
+
+            # Bounce off boundaries
+            if abs(xy[0]) > bounds:
+                vel[0] *= -1
+            if abs(xy[1]) > bounds:
+                vel[1] *= -1
+
+            self.obstacle_velocities[i] = vel
+
+            p.resetBaseVelocity(
+                obs_id,
+                linearVelocity=[vel[0], vel[1], 0],
+                angularVelocity=[0, 0, 0]
+            )
 
     # =========================
     def step(self, action):
         self.steps += 1
 
         action = np.clip(action, -1, 1)
-
-        action = 0.4 * self.prev_action + 0.6 * action
+        action = 0.3 * self.prev_action + 0.7 * action
         self.prev_action = action
 
         forward, turn = action
-        speed = 15.0  # reduced from 25 — high speed overpowers collision physics
+        speed = 12.0
 
-        left = (forward - 0.4 * turn) * speed
-        right = (forward + 0.4 * turn) * speed
+        # increased turn scaling from 0.4 to 0.6
+        # so robot can rotate fast enough to align before moving
+        left = (forward - 0.6 * turn) * speed
+        right = (forward + 0.6 * turn) * speed
 
         p.setJointMotorControl2(
-            self.robot,
-            self.left_wheel,
+            self.robot, self.left_wheel,
             p.VELOCITY_CONTROL,
             targetVelocity=left,
-            force=800  # reduced from 5000 — lower force respects physics collisions
+            force=800
         )
         p.setJointMotorControl2(
-            self.robot,
-            self.right_wheel,
+            self.robot, self.right_wheel,
             p.VELOCITY_CONTROL,
             targetVelocity=right,
             force=800
         )
+
+        self._update_obstacles()
 
         for _ in range(4):
             p.stepSimulation()
@@ -187,6 +219,7 @@ class NavigationEnv(gym.Env):
         truncated = self.steps >= self.max_steps
 
         return obs, reward, done, truncated, {}
+       
 
     # =========================
     def _get_obs(self):
@@ -218,19 +251,22 @@ class NavigationEnv(gym.Env):
         ], dtype=np.float32)
 
         obs_vecs = []
-        for obs_id in self.obstacles:
+        for i, obs_id in enumerate(self.obstacles):
             obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
             rel = np.array(obs_pos_world[:2], dtype=np.float32) - xy
             rel_norm = np.clip(rel / 2.0, -1, 1)
             obs_dist = np.linalg.norm(rel)
             closeness = np.clip(1.0 - obs_dist / 0.8, 0.0, 1.0)
-            obs_vecs.extend([rel_norm[0], rel_norm[1], closeness])
+
+            vel = self.obstacle_velocities[i]
+            vel_norm = np.clip(vel / self.obstacle_speed, -1, 1)
+
+            obs_vecs.extend([rel_norm[0], rel_norm[1], closeness, vel_norm[0], vel_norm[1]])
 
         return np.concatenate([base_obs, np.array(obs_vecs, dtype=np.float32)])
 
     # =========================
     def _check_collision(self):
-        # Use real PyBullet contact detection instead of distance approximation
         for obs_id in self.obstacles:
             contacts = p.getContactPoints(self.robot, obs_id)
             if contacts and len(contacts) > 0:
@@ -250,41 +286,94 @@ class NavigationEnv(gym.Env):
         progress = self.prev_dist - dist
         self.prev_dist = dist
 
-        reward = 20.0 * progress
-
         yaw = p.getEulerFromQuaternion(orn)[2]
         goal_angle = np.arctan2(self.goal[1] - xy[1], self.goal[0] - xy[0])
         angle_diff = np.arctan2(np.sin(goal_angle - yaw), np.cos(goal_angle - yaw))
-        reward += 0.8 * np.cos(angle_diff)
 
         _, angular_vel = p.getBaseVelocity(self.robot)
-        reward -= 0.03 * abs(angular_vel[2])
+        aligned = abs(angle_diff) < 0.3  # robot is roughly facing the goal
 
-        reward -= 0.001
-        reward -= 0.01 * dist
+        # ---- PHASE 1: ALIGNMENT ----
+        # when not aligned, heavily reward turning toward goal
+        # and penalize moving forward so robot rotates first
+        if not aligned:
+            # STRONG heading reward — rotating toward goal is the only goal right now
+            reward = 2.0 * np.cos(angle_diff)
 
-        # Success
-        if dist < 0.2:
-            speed_bonus = 40.0 * (1.0 - self.steps / self.max_steps)
-            return float(reward + 300.0 + speed_bonus)
+            # PENALIZE forward motion when not aligned — rotate first, move second
+            reward -= 0.5 * abs(action[0])
 
-        # Real contact penalty
-        if self._check_collision():
-            reward -= 100.0
+            # PENALIZE spinning in wrong direction
+            reward -= 0.05 * abs(angular_vel[2])
 
-        # Soft proximity penalty
+            # small time penalty
+            reward -= 0.005
+
+        # ---- PHASE 2: MOVE TOWARD GOAL ----
+        # once aligned, switch to progress-based reward
+        else:
+            # PROGRESS — strong forward signal once aligned
+            # higher = faster approach, lower = more cautious
+            reward = 10.0 * progress
+
+            # HEADING maintenance — small bonus to stay aligned while moving
+            # keep low so robot doesn't stop to re-align constantly
+            reward += 0.3 * np.cos(angle_diff)
+
+            # PENALIZE spinning while moving — robot should drive straight
+            reward -= 0.15 * abs(angular_vel[2])
+
+            # DISTANCE PENALTY — urgency to close gap
+            reward -= 0.05 * dist
+
+            # TIME PENALTY
+            reward -= 0.005
+
+        # ---- PHASE 3: OBSTACLE AVOIDANCE ----
+        # always active regardless of phase
+        # check nearest obstacle and react
+
+        nearest_obs_dist = float('inf')
         for obs_id in self.obstacles:
             obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
             obs_xy = np.array(obs_pos_world[:2], dtype=np.float32)
             obs_dist = np.linalg.norm(xy - obs_xy)
-            if obs_dist < 0.5:
-                reward -= 6.0 * (0.4 - obs_dist)
+            if obs_dist < nearest_obs_dist:
+                nearest_obs_dist = obs_dist
+
+        # when obstacle is close, temporarily override heading penalty
+        # so robot can turn freely to avoid it
+        obstacle_nearby = nearest_obs_dist < 0.5
+
+        if obstacle_nearby:
+            # RELEASE turn penalty — robot needs to steer freely to avoid
+            reward += 0.05 * abs(action[1])  # small bonus for actually steering
+
+            # PROXIMITY PENALTY — scale with closeness
+            # 0.35 = danger zone, 0.5 = penalty strength
+            for obs_id in self.obstacles:
+                obs_pos_world, _ = p.getBasePositionAndOrientation(obs_id)
+                obs_xy = np.array(obs_pos_world[:2], dtype=np.float32)
+                obs_dist = np.linalg.norm(xy - obs_xy)
+                if obs_dist < 0.35:
+                    reward -= 0.5 * (0.35 - obs_dist)
+
+        # COLLISION PENALTY — always active
+        # increase if robot still hits obstacles
+        # decrease if robot is too afraid to move
+        if self._check_collision():
+            reward -= 5.0
+
+        # SUCCESS BONUS — reaching goal
+        # speed_bonus encourages finishing quickly
+        if dist < 0.2:
+            speed_bonus = 5.0 * (1.0 - self.steps / self.max_steps)
+            return float(reward + 30.0 + speed_bonus)
 
         return float(reward)
-
     # =========================
     def _check_done(self):
         pos, _ = p.getBasePositionAndOrientation(self.robot)
         xy = np.array(pos[:2], dtype=np.float32)
 
-        return np.linalg.norm(xy - self.goal) < 0.2
+        return np.linalg.norm(xy - self.goal) < 0.1
